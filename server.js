@@ -47,6 +47,35 @@ async function upstream(target, init = {}) {
 // ---------- ブラウザ側で動くランタイム(HTMLに注入される) ----------
 function runtime() {
   const S = window.__SJ;
+
+  // sandbox の iframe では storage / cookie に触ると例外になるので、メモリ上の代わりを用意する
+  const mem = () => {
+    const m = new Map();
+    return {
+      getItem: (k) => (m.has(String(k)) ? m.get(String(k)) : null),
+      setItem: (k, v) => void m.set(String(k), String(v)),
+      removeItem: (k) => void m.delete(String(k)),
+      clear: () => m.clear(),
+      key: (i) => [...m.keys()][i] ?? null,
+      get length() { return m.size; },
+    };
+  };
+  for (const n of ["localStorage", "sessionStorage"]) {
+    try { window[n].getItem("x"); } catch {
+      try { Object.defineProperty(window, n, { value: mem(), configurable: true }); } catch {}
+    }
+  }
+  try { void document.cookie; } catch {
+    let c = "";
+    try {
+      Object.defineProperty(document, "cookie", {
+        get: () => c,
+        set: (v) => { c += (c ? "; " : "") + String(v).split(";")[0]; },
+        configurable: true,
+      });
+    } catch {}
+  }
+
   const px = (u) => {
     try {
       const a = new URL(u, S.base).href;
@@ -86,19 +115,28 @@ function runtime() {
     return sa.call(this, n, v);
   };
 
-  // リンク・フォームは Apps Script 経由で開き直す
+  // リンク・フォームは、親(Apps Script のタブ画面)に知らせて開き直してもらう
   const go = (u) => {
-    const a = new URL(u, S.base).href;
-    top.location.href = S.app + (S.app.includes("?") ? "&" : "?") + "url=" + encodeURIComponent(a);
+    try { parent.postMessage({ type: "sj-nav", url: new URL(u, S.base).href }, "*"); } catch {}
   };
   document.addEventListener("click", (e) => {
     const a = e.target.closest && e.target.closest("a[href]");
     if (!a || e.defaultPrevented || e.ctrlKey || e.metaKey) return;
     const h = a.getAttribute("href");
-    if (!h || /^(#|javascript:|mailto:|tel:)/i.test(h)) return;
+    if (!h || /^(javascript:|mailto:|tel:)/i.test(h)) return;
     e.preventDefault();
+    if (h[0] === "#") { // ページ内リンクは、その場でスクロール
+      let t = null;
+      try {
+        const id = decodeURIComponent(h.slice(1));
+        t = document.getElementById(id) || document.getElementsByName(id)[0];
+      } catch {}
+      if (t) t.scrollIntoView(); else if (h === "#") window.scrollTo(0, 0);
+      return;
+    }
     go(h);
   });
+  window.open = (u) => { if (u) go(u); return null; };
   document.addEventListener("submit", (e) => {
     const form = e.target;
     if (e.defaultPrevented || (form.method || "get").toLowerCase() !== "get") return;
@@ -111,7 +149,7 @@ function runtime() {
 const RUNTIME = `(${runtime.toString()})()`;
 
 // ---------- HTML書き換え ----------
-function rewriteHtml(html, base, appUrl) {
+function rewriteHtml(html, base) {
   const $ = cheerio.load(html);
   $("base").remove();
   $("meta[http-equiv]").filter((_, el) => /content-security-policy/i.test($(el).attr("http-equiv"))).remove();
@@ -144,7 +182,7 @@ function rewriteHtml(html, base, appUrl) {
   $("style").each((_, el) => $(el).text(rewriteCss($(el).text(), base)));
   $("[style]").each((_, el) => $(el).attr("style", rewriteCss($(el).attr("style"), base)));
 
-  const cfg = JSON.stringify({ base, proxy: BASE, key: KEY, app: appUrl }).replace(/</g, "\\u003c");
+  const cfg = JSON.stringify({ base, proxy: BASE, key: KEY }).replace(/</g, "\\u003c");
   $("head").prepend(`<script>window.__SJ=${cfg}</script><script>${RUNTIME}</script>`);
   return $.html();
 }
@@ -171,7 +209,7 @@ app.get("/page", async (req, res) => {
       res.type(ct || "application/octet-stream").send(Buffer.from(await r.arrayBuffer()));
       return;
     }
-    res.type("html").send(rewriteHtml(await r.text(), r.url, req.query.app || ""));
+    res.type("html").send(rewriteHtml(await r.text(), r.url));
   } catch (e) {
     res.status(502).send("error: " + e.message);
   }
